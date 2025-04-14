@@ -231,21 +231,21 @@ def main():
     y_pred_classes = np.argmax(y_pred, axis=1)
     print(classification_report(y_test, y_pred_classes, target_names=encoder.classes_))
 
-    # (옵션) 테스트 비디오로 예측 확인
-    test_video_path = "test_samples/sample.mp4"
-    if os.path.exists(test_video_path):
-        frames = extract_frames_from_video(test_video_path, SEQUENCE_LENGTH)
-        if frames is not None:
-            input_data = np.expand_dims(frames, axis=0)
-            prediction = model.predict(input_data, verbose=0)[0]
-            pred_index = np.argmax(prediction)
-            pred_class = encoder.classes_[pred_index]
-            confidence = prediction[pred_index]
-            print(f"테스트 비디오 예측 결과: {pred_class} ({confidence:.2f})")
-        else:
-            print("테스트 비디오 프레임 추출 실패")
-    else:
-        print("테스트 비디오 파일이 존재하지 않습니다.")
+    # # (옵션) 테스트 비디오로 예측 확인
+    # test_video_path = "test_samples/sample.mp4"
+    # if os.path.exists(test_video_path):
+    #     frames = extract_frames_from_video(test_video_path, SEQUENCE_LENGTH)
+    #     if frames is not None:
+    #         input_data = np.expand_dims(frames, axis=0)
+    #         prediction = model.predict(input_data, verbose=0)[0]
+    #         pred_index = np.argmax(prediction)
+    #         pred_class = encoder.classes_[pred_index]
+    #         confidence = prediction[pred_index]
+    #         print(f"테스트 비디오 예측 결과: {pred_class} ({confidence:.2f})")
+    #     else:
+    #         print("테스트 비디오 프레임 추출 실패")
+    # else:
+    #     print("테스트 비디오 파일이 존재하지 않습니다.")
 
 if __name__ == "__main__":
     main()

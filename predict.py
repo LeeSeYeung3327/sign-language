@@ -5,12 +5,19 @@ import mediapipe as mp
 from torch import nn
 
 # ----------------------------
+# (추가) 정적 손 모양 검증 함수 (실제 환경에 맞게 구현 필요)
+# ----------------------------
+def check_static_hand_shape(kp_seq):
+    """
+    손가락 모양 등 정적인 특징을 기반으로 수어 동작에 맞는지 체크합니다.
+    여기서는 예제로 항상 True를 반환합니다.
+    """
+    return True
+
+# ----------------------------
 # 전처리 및 스무딩 함수들
 # ----------------------------
 def normalize_and_pad(kp_seq, sequence_length):
-    """
-    키포인트 시퀀스를 정규화하고, 시퀀스 길이가 부족하면 마지막 프레임을 반복하여 채움.
-    """
     if kp_seq.shape[0] == 0:
         kp_seq = np.zeros((sequence_length, 42, 2), dtype=np.float32)
     normalized = []
@@ -31,11 +38,6 @@ def normalize_and_pad(kp_seq, sequence_length):
     return normalized
 
 def filter_static_hand(sequence, movement_threshold=0.01):
-    """
-    양 손의 이동량을 계산하여, 양쪽 모두 이동량이 매우 작으면 '정적인 손'으로 판단.
-      - 이 경우 None을 반환하여 process_keypoints에서 fallback(원본 데이터 사용) 하도록 함.
-      - 그렇지 않으면, 상대적으로 움직임이 적은 손의 키포인트를 0으로 처리합니다.
-    """
     diff = np.diff(sequence, axis=0)  # (T-1, 42, 2)
     left_diff = np.linalg.norm(diff[:, 0:21, :], axis=-1)
     right_diff = np.linalg.norm(diff[:, 21:42, :], axis=-1)
@@ -45,8 +47,7 @@ def filter_static_hand(sequence, movement_threshold=0.01):
     if left_mean < movement_threshold and right_mean < movement_threshold:
         print(f"Static hand condition met (left: {left_mean:.4f}, right: {right_mean:.4f}).")
         print("Using unfiltered keypoints for prediction as fallback.")
-        return None  # fallback: unfiltered 데이터를 사용
-    
+        return None
     if left_mean < right_mean:
         sequence[:, 0:21, :] = 0
         print(f"Filtered: Left hand removed (mean {left_mean:.4f} vs {right_mean:.4f}).")
@@ -56,18 +57,12 @@ def filter_static_hand(sequence, movement_threshold=0.01):
     return sequence
 
 def compute_movement(kp_seq):
-    """
-    각 프레임 간 키포인트 변화량(움직임)을 계산하여 평균 움직임을 반환.
-    """
     diff = np.diff(kp_seq, axis=0)
     movement = np.linalg.norm(diff, axis=-1)
     avg_movement = np.mean(movement)
     return avg_movement
 
 def smooth_keypoints_ema(kp_seq, alpha=0.7):
-    """
-    EMA(지수 이동 평균)를 적용하여 키포인트 시퀀스를 평활화합니다.
-    """
     T, _, _ = kp_seq.shape
     smoothed = np.copy(kp_seq)
     for t in range(1, T):
@@ -78,11 +73,6 @@ def smooth_keypoints_ema(kp_seq, alpha=0.7):
 # 프레임 처리 함수 (process_frame)
 # ----------------------------
 def process_frame(frame, results, last_left, last_right, no_hand_printed):
-    """
-    각 프레임에서 손의 랜드마크를 추출합니다.
-    만약 손이 검출되지 않으면 이전 프레임의 정보를 사용하며,
-    no_hand_printed 플래그로 "No hand detected" 메시지의 중복 출력을 방지합니다.
-    """
     frame_keypoints = np.zeros((42, 2), dtype=np.float32)
     if results.multi_hand_landmarks and results.multi_handedness:
         for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
@@ -110,25 +100,26 @@ def process_frame(frame, results, last_left, last_right, no_hand_printed):
 # ----------------------------
 def process_keypoints(kp_seq_buffer, sequence_length, model, device,
                       confidence_threshold=0.8, ambiguous_margin=0.2):
-    """
-    버퍼에 저장된 키포인트 시퀀스를 전처리한 후 모델 예측을 수행합니다.
-    - 정적 손 조건(filter_static_hand)이 None인 경우 fallback하여 unfiltered 데이터를 사용.
-    - 예측 시 확신도가 부족하거나, 최고 확률과 두번째 확률 차이가 ambiguous_margin 미만이면 예측을 거부합니다.
-    """
     kp_seq = np.array(kp_seq_buffer)  # (T, 42, 2)
     kp_seq = normalize_and_pad(kp_seq, sequence_length)
     filtered_seq = filter_static_hand(kp_seq, movement_threshold=0.01)
     if filtered_seq is None:
         print("Static hand condition detected. Fallback: Using unfiltered keypoints for prediction.")
-        filtered_seq = kp_seq  # fallback
+        filtered_seq = kp_seq
     smoothed_seq = smooth_keypoints_ema(filtered_seq, alpha=0.7)
+    
+    # 정적인 손 모양(수어 단어) 체크를 수행하여, 해당 기준에 부합하지 않으면 예측 거부
+    if not check_static_hand_shape(smoothed_seq):
+        print("Static hand shape check failed. Skipping prediction.")
+        return None, None
+
+    # **움직임 임계치 조정**: "팔 내리고 가리키는" 동작과 같이 움직임이 작을 수 있으므로 threshold를 0.002로 낮춤.
     avg_move = compute_movement(smoothed_seq)
     print(f"Avg Movement: {avg_move:.4f}")
-    if avg_move < 0.005:
+    if avg_move < 0.002:
         print("Insufficient movement detected. Skipping prediction.")
         return None, None
 
-    # 모델 입력: (1, T, 1, 42, 2)
     x_tensor = torch.tensor(smoothed_seq, dtype=torch.float32).unsqueeze(0).unsqueeze(2).to(device)
     with torch.no_grad():
         output = model(x_tensor)
@@ -146,7 +137,7 @@ def process_keypoints(kp_seq_buffer, sequence_length, model, device,
         return label_map[pred_class], top_prob_val
 
 # ----------------------------
-# 모델 정의 및 초기화 (한 번만 로드/설정)
+# 모델 정의 및 초기화
 # ----------------------------
 class CNN_LSTMModel(nn.Module):
     def __init__(self, cnn_out_dim, lstm_hidden_size, num_classes, dropout=0.5):
@@ -186,7 +177,31 @@ class CNN_LSTMModel(nn.Module):
         return out
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-label_map = {0: '감사합니다', 1: '아니', 2: '안녕하세요'}
+label_map = {
+    0: '가슴',
+    1: '감사합니다',
+    2: '구토',
+    3: '귀',
+    4: '기침',
+    5: '다리',
+    6: '맞다',
+    7: '머리',
+    8: '목',
+    9: '무릎',
+    10: '발',
+    11: '발목',
+    12: '복부',
+    13: '손목뼈',
+    14: '아니',
+    15: '아프다',
+    16: '안녕하세요',
+    17: '어깨',
+    18: '어지럽다',
+    19: '열',
+    20: '팔',
+    21: '팔꿈치',
+    22: '허리'
+}
 num_classes = len(label_map)
 cnn_out_dim = 256
 lstm_hidden_size = 128
@@ -216,11 +231,11 @@ keypoints_buffer = []      # 각 프레임의 키포인트 저장
 prediction_buffer = []     # 연속 예측 결과를 통한 안정성 확보 버퍼
 no_hand_msg_printed = False
 no_hand_count = 0
-no_hand_threshold = 30     # 약 1초(30 프레임) 이상 손 검출 실패 시 버퍼 리셋
+no_hand_threshold = 30     # 약 30 프레임 (약 1초) 이상 손 검출 실패 시 버퍼 리셋
 
 last_left_landmarks = None
 last_right_landmarks = None
-consecutive_threshold = 3   # 연속해서 동일 예측이 3회 이상 있을 때 최종 예측 확정
+consecutive_threshold = 3   # 연속 3회 동일 예측이면 최종 확정
 last_stable_prediction = None
 
 while True:
@@ -246,7 +261,7 @@ while True:
     
     keypoints_buffer.append(keypoints)
     
-    # 손 검출 실패가 연속되면 버퍼 리셋 (예: 30 프레임 이상)
+    # 손 검출 실패가 연속되면 버퍼 초기화
     if not results.multi_hand_landmarks:
         no_hand_count += 1
     else:
@@ -264,7 +279,7 @@ while True:
         if prediction is not None:
             prediction_buffer.append(prediction)
             print(f"Buffered prediction: {prediction}")
-            # 예측 안정성: 버퍼 내 결과가 모두 동일해야 최종 예측 확정
+            # 예측 안정성: 버퍼 내 예측 결과가 모두 동일할 때만 최종 예측 출력
             if len(prediction_buffer) >= consecutive_threshold:
                 if all(p == prediction_buffer[0] for p in prediction_buffer):
                     final_pred = prediction_buffer[0]
@@ -279,7 +294,7 @@ while True:
                 prediction_buffer = []  # 예측 버퍼 즉시 초기화
         else:
             print("Prediction failed or rejected due to conditions.")
-            prediction_buffer = []  # 예측 실패 시에도 버퍼 초기화
+            prediction_buffer = []  # 예측 실패 시 버퍼 초기화
         keypoints_buffer = []  # 시퀀스 버퍼 초기화
     
     if cv2.waitKey(1) & 0xFF == ord("q"):

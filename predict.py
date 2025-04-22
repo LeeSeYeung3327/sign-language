@@ -245,7 +245,7 @@ while True:
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(frame_rgb)
     
-    # 각 프레임 처리: 손 검출 및 키포인트 추출
+    # 각 프레임의 키포인트 추출
     keypoints, last_left_landmarks, last_right_landmarks, no_hand_msg_printed = process_frame(
         frame, results, last_left_landmarks, last_right_landmarks, no_hand_msg_printed
     )
@@ -261,42 +261,35 @@ while True:
     
     keypoints_buffer.append(keypoints)
     
-    # 손 검출 실패가 연속되면 버퍼 초기화
+    # 손이 검출되지 않으면 no_hand_count 증가, 검출되면 0으로 초기화
     if not results.multi_hand_landmarks:
         no_hand_count += 1
     else:
         no_hand_count = 0
+
+    # 오랜 기간 손이 검출되지 않으면 버퍼 초기화
     if no_hand_count > no_hand_threshold:
         print("Extended period with no hand detected. Resetting keypoints buffer.")
         keypoints_buffer = []
         prediction_buffer = []
         no_hand_count = 0
-    
-    # 충분한 프레임이 모이면 예측 수행 및 버퍼 즉시 초기화
+
+    # 버퍼가 최대 길이(예, 64프레임)에 도달하면 예측 후 바로 버퍼를 초기화하여 다음 동작에 대응
     if len(keypoints_buffer) == sequence_length:
         prediction, conf = process_keypoints(keypoints_buffer, sequence_length, model, device,
                                              confidence_threshold=0.8, ambiguous_margin=0.2)
         if prediction is not None:
-            prediction_buffer.append(prediction)
-            print(f"Buffered prediction: {prediction}")
-            # 예측 안정성: 버퍼 내 예측 결과가 모두 동일할 때만 최종 예측 출력
-            if len(prediction_buffer) >= consecutive_threshold:
-                if all(p == prediction_buffer[0] for p in prediction_buffer):
-                    final_pred = prediction_buffer[0]
-                    if final_pred != last_stable_prediction:
-                        last_stable_prediction = final_pred
-                        cv2.putText(frame, final_pred, (10, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                                    1.2, (0, 255, 0), 2)
-                        cv2.imshow("Webcam", frame)
-                        print(f"Final prediction: {final_pred}")
-                else:
-                    print("Prediction unstable. No final output.")
-                prediction_buffer = []  # 예측 버퍼 즉시 초기화
+            print(f"Prediction: {prediction} with confidence: {conf:.2f}")
+            # 바로 예측 결과를 화면에 출력
+            cv2.putText(frame, prediction, (10, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2, (0, 255, 0), 2)
+            cv2.imshow("Webcam", frame)
         else:
             print("Prediction failed or rejected due to conditions.")
-            prediction_buffer = []  # 예측 실패 시 버퍼 초기화
-        keypoints_buffer = []  # 시퀀스 버퍼 초기화
-    
+        # 예측 후 즉시 버퍼 초기화하여 다음 동작을 기다림
+        keypoints_buffer = []
+        no_hand_count = 0
+
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 

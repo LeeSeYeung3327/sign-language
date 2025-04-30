@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <title>수어 예측 시스템</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        text-align: center;
+        background-color: #f5f5f5;
+        margin: 0;
+        padding: 20px;
+      }
+      h1 {
+        color: #333;
+      }
+      #video {
+        border: 1px solid #000;
+        margin-bottom: 20px;
+      }
+      .output {
+        font-size: 1.2em;
+        margin: 15px 0;
+      }
+      button {
+        padding: 10px 20px;
+        font-size: 1em;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>🧠 수어 예측 시스템</h1>
+
+    <!-- 웹캠 스트리밍 -->
+    <img id="video" src="/video_feed" width="480" height="360" alt="Webcam Stream" />
+
+    <!-- 예측된 단어들을 나열 -->
+    <p class="output">
+      <strong>예측된 단어들:</strong>
+      <span id="predictedWords">-</span>
+    </p>
+
+    <!-- 문장 생성 버튼 -->
+    <button id="genSentenceBtn">문장 생성</button>
+
+    <!-- 생성된 자연스러운 문장 출력 -->
+    <p class="output">
+      <strong>자연스러운 문장:</strong>
+      <span id="sentence">-</span>
+    </p>
+
+    <script>
+      let keywordInterval = null;
+      let previousKeywords = "";  // 이전 단어 저장
+
+      // 키워드 폴링 함수
+      function startFetchingKeywords() {
+        keywordInterval = setInterval(() => {
+          fetch("/keywords")
+            .then((res) => res.json())
+            .then((data) => {
+              // 예측된 단어가 변경된 경우에만 업데이트
+              const newKeywords = data.keywords || "-";
+              if (newKeywords !== previousKeywords) {
+                document.getElementById("predictedWords").innerText = newKeywords;
+                previousKeywords = newKeywords;
+              }
+            })
+            .catch((err) => console.error("Error fetching keywords:", err));
+        }, 3000);
+      }
+
+      function stopFetchingKeywords() {
+        if (keywordInterval) {
+          clearInterval(keywordInterval);
+          keywordInterval = null;
+        }
+      }
+
+      // 문장 생성 버튼 핸들러
+      document.getElementById("genSentenceBtn").addEventListener("click", () => {
+        const words = document.getElementById("predictedWords").innerText;
+        if (!words || words.trim() === "-" || words.trim() === "") {
+          alert("예측된 단어가 없습니다.");
+          return;
+        }
+
+        // 키워드 갱신 중단
+        stopFetchingKeywords();
+
+        // 문장 생성 요청
+        fetch(`/gen_sentence?word=${encodeURIComponent(words)}`)
+          .then((res) => res.json())
+          .then((data) => {
+            // 생성된 문장 업데이트
+            document.getElementById("sentence").innerText = data.sentence;
+
+            // 음성 출력 (ko-KR)
+            const utter = new SpeechSynthesisUtterance(data.sentence);
+            utter.lang = "ko-KR";
+            speechSynthesis.speak(utter);
+
+            // 예측 단어 영역 초기화 (즉시 UI상 표시 제거)
+            document.getElementById("predictedWords").innerText = "-";
+            previousKeywords = "-";
+
+            // 키워드 폴링 재시작
+            startFetchingKeywords();
+          })
+          .catch((err) => {
+            console.error("Error generating sentence:", err);
+            startFetchingKeywords();
+          });
+      });
+
+      // 초기 키워드 폴링 시작
+      startFetchingKeywords();
+    </script>
+  </body>
+</html>

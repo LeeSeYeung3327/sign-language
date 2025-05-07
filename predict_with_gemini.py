@@ -11,16 +11,14 @@ import uvicorn
 import requests
 import os
 from fastapi.middleware.cors import CORSMiddleware
-from collections import deque
+from collections import deque, Counter
 
-# ---------------------------------
+DEBUG_MODE = False  # 필요 시 True로 변경하여 로그를 확인하세요.
+
+# ------------------------------
 # 전처리 및 스무딩 함수들
-# ---------------------------------
+# ------------------------------
 def check_static_hand_shape(kp_seq):
-    """
-    손가락 모양 등의 정적인 특징을 기반으로 올바른 수어 동작인지 확인합니다.
-    (실제 환경에 맞게 구현 필요, 여기서는 예제로 항상 True 반환)
-    """
     return True
 
 def normalize_and_pad(kp_seq, sequence_length):
@@ -39,87 +37,117 @@ def normalize_and_pad(kp_seq, sequence_length):
         pad = np.repeat(normalized[-1][np.newaxis, :], sequence_length - normalized.shape[0], axis=0)
         normalized = np.concatenate([normalized, pad], axis=0)
     else:
-        idxs = np.linspace(0, normalized.shape[0]-1, sequence_length).astype(int)
+        idxs = np.linspace(0, normalized.shape[0] - 1, sequence_length).astype(int)
         normalized = normalized[idxs]
     return normalized
 
 def filter_static_hand(sequence, movement_threshold=0.01):
-    diff = np.diff(sequence, axis=0)  # (T-1, 42, 2)
+    diff = np.diff(sequence, axis=0)
     left_diff = np.linalg.norm(diff[:, 0:21, :], axis=-1)
     right_diff = np.linalg.norm(diff[:, 21:42, :], axis=-1)
     left_mean = np.mean(left_diff)
     right_mean = np.mean(right_diff)
     if left_mean < movement_threshold and right_mean < movement_threshold:
-        print(f"Static hand condition met (left: {left_mean:.4f}, right: {right_mean:.4f}).")
-        print("Using unfiltered keypoints for prediction as fallback.")
+        if DEBUG_MODE:
+            print(f"Static hand condition: L={left_mean:.4f}, R={right_mean:.4f}.")
         return None
     if left_mean < right_mean:
         sequence[:, 0:21, :] = 0
-        print(f"Filtered: Left hand removed (mean {left_mean:.4f} vs {right_mean:.4f}).")
     else:
         sequence[:, 21:42, :] = 0
-        print(f"Filtered: Right hand removed (mean {right_mean:.4f} vs {left_mean:.4f}).")
     return sequence
 
 def compute_movement(kp_seq):
     diff = np.diff(kp_seq, axis=0)
     movement = np.linalg.norm(diff, axis=-1)
-    avg_movement = np.mean(movement)
-    return avg_movement
+    return np.mean(movement)
 
 def smooth_keypoints_ema(kp_seq, alpha=0.7):
     T, _, _ = kp_seq.shape
     smoothed = np.copy(kp_seq)
     for t in range(1, T):
-        smoothed[t] = alpha * kp_seq[t] + (1 - alpha) * smoothed[t-1]
+        smoothed[t] = alpha * kp_seq[t] + (1 - alpha) * smoothed[t - 1]
     return smoothed
 
-# ---------------------------------
-# 프레임 처리 함수
-# ---------------------------------
+# ------------------------------
+# 프레임 처리: 양손 관절 좌표 추출 및 결합
+# ------------------------------
 def process_frame(frame, results, last_left, last_right, no_hand_printed):
-    frame_keypoints = np.zeros((42, 2), dtype=np.float32)
+    """
+    Mediapipe의 결과에서 두 손의 landmark를 추출하여, 
+    왼손은 인덱스 0~20, 오른손은 인덱스 21~41로 결합합니다.
+    만약 landmark가 21개 미만이면 이전 값(last_left 또는 last_right)을 사용하거나,
+    한쪽 손만 검출되면 그 landmark를 복제하여 양손 모두 채웁니다.
+    좌표는 np.clip()을 통해 [0,1] 범위로 제한됩니다.
+    """
+    combined_keypoints = np.zeros((42, 2), dtype=np.float32)
+    left_points = None
+    right_points = None
+
     if results.multi_hand_landmarks and results.multi_handedness:
-        for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-            handedness = results.multi_handedness[idx].classification[0].label
-            landmarks = np.array([[lm.x, lm.y] for lm in hand_landmarks.landmark], dtype=np.float32)
-            if handedness == "Left":
-                frame_keypoints[0:21] = landmarks
-                last_left = landmarks.copy()
-            elif handedness == "Right":
-                frame_keypoints[21:42] = landmarks
-                last_right = landmarks.copy()
+        for i in range(len(results.multi_hand_landmarks)):
+            label = results.multi_handedness[i].classification[0].label
+            if DEBUG_MODE:
+                print(f"Detected hand {i}: {label}")
+            landmarks = results.multi_hand_landmarks[i].landmark
+            if len(landmarks) < 21:
+                if label == "Left" and last_left is not None:
+                    points = last_left
+                elif label == "Right" and last_right is not None:
+                    points = last_right
+                else:
+                    points = np.zeros((21, 2), dtype=np.float32)
+            else:
+                points = np.array([[lm.x, lm.y] for lm in landmarks], dtype=np.float32)
+                points = np.clip(points, 0.0, 1.0)
+            if label == "Left":
+                left_points = points.copy()
+            elif label == "Right":
+                right_points = points.copy()
         no_hand_printed = False
     else:
-        if not no_hand_printed:
-            print("No hand detected; using previous landmarks.")
-            no_hand_printed = True
-        if last_left is not None:
-            frame_keypoints[0:21] = last_left
-        if last_right is not None:
-            frame_keypoints[21:42] = last_right
-    return frame_keypoints, last_left, last_right, no_hand_printed
+        if not no_hand_printed and DEBUG_MODE:
+            print("No hand detected; reusing previous landmarks.")
+
+    # 만약 한쪽 손의 landmark가 누락되었으면, 검출된 한쪽의 landmark를 복제하여 사용.
+    if left_points is None and right_points is not None:
+        left_points = right_points.copy()
+    if right_points is None and left_points is not None:
+        right_points = left_points.copy()
+
+    if left_points is None:
+        left_points = last_left if last_left is not None else np.zeros((21, 2), dtype=np.float32)
+    if right_points is None:
+        right_points = last_right if last_right is not None else np.zeros((21, 2), dtype=np.float32)
+
+    combined_keypoints[0:21] = left_points
+    combined_keypoints[21:42] = right_points
+
+    last_left = left_points
+    last_right = right_points
+
+    return combined_keypoints, last_left, last_right, no_hand_printed
 
 def process_keypoints(kp_seq_buffer, sequence_length, model_to_use, device,
-                      confidence_threshold=0.8, ambiguous_margin=0.2):
-    kp_seq = np.array(kp_seq_buffer)  # (T, 42, 2)
+                      confidence_threshold=0.75, ambiguous_margin=0.2, end_of_gesture=False):
+    kp_seq = np.array(kp_seq_buffer)
     kp_seq = normalize_and_pad(kp_seq, sequence_length)
     filtered_seq = filter_static_hand(kp_seq, movement_threshold=0.01)
     if filtered_seq is None:
-        print("Static hand condition detected. Using unfiltered keypoints for prediction.")
         filtered_seq = kp_seq
     smoothed_seq = smooth_keypoints_ema(filtered_seq, alpha=0.7)
-    
+
     if not check_static_hand_shape(smoothed_seq):
-        print("Static hand shape check failed. Skipping prediction.")
         return None, None
 
     avg_move = compute_movement(smoothed_seq)
-    print(f"Avg Movement: {avg_move:.4f}")
-    if avg_move < 0.002:
-        print("Insufficient movement detected. Skipping prediction.")
+    if DEBUG_MODE:
+        print(f"Avg Movement: {avg_move:.4f}")
+    if not end_of_gesture and avg_move < 0.02:
+        if DEBUG_MODE:
+            print("Insufficient movement, skipping prediction.")
         return None, None
-    
+
     x_tensor = torch.tensor(smoothed_seq, dtype=torch.float32).unsqueeze(0).unsqueeze(2).to(device)
     with torch.no_grad():
         output = model_to_use(x_tensor)
@@ -127,18 +155,24 @@ def process_keypoints(kp_seq_buffer, sequence_length, model_to_use, device,
         top_prob, pred = torch.max(probs, dim=1)
         top_prob_val = top_prob.item()
         pred_class = pred.item()
+        if DEBUG_MODE:
+            print(f"Softmax Top Prob: {top_prob_val:.2f}")
         if top_prob_val < confidence_threshold:
-            print(f"Prediction rejected: Low confidence (confidence={top_prob_val:.2f}).")
+            if DEBUG_MODE:
+                print("Low confidence, skipping prediction.")
             return None, None
         diff_prob = (torch.topk(probs, 2).values[0][0] - torch.topk(probs, 2).values[0][1]).item()
+        if DEBUG_MODE:
+            print(f"Diff Prob: {diff_prob:.2f}")
         if diff_prob < ambiguous_margin:
-            print(f"Prediction rejected: Ambiguous gesture (difference={diff_prob:.2f}).")
+            if DEBUG_MODE:
+                print("Ambiguous gesture, skipping prediction.")
             return None, None
         return label_map[pred_class], top_prob_val
 
-# ---------------------------------
+# ------------------------------
 # CNN-LSTM 모델 정의
-# ---------------------------------
+# ------------------------------
 class CNN_LSTMModel(nn.Module):
     def __init__(self, cnn_out_dim, lstm_hidden_size, num_classes, dropout=0.5):
         super(CNN_LSTMModel, self).__init__()
@@ -176,33 +210,25 @@ class CNN_LSTMModel(nn.Module):
         out = self.fc(lstm_out[:, -1, :])
         return out
 
-# ---------------------------------
-# Gemini API를 활용한 문장 생성 함수
-# ---------------------------------
+# ------------------------------
+# Gemini API 문장 생성 함수 및 Text Post-process
+# ------------------------------
 def convert_to_sentence(words: str) -> str:
     if not words.strip():
-        print("convert_to_sentence: 입력된 단어가 없습니다.")
+        if DEBUG_MODE:
+            print("No word input provided.")
         return ""
-    prompt_text = (
-        f"다음 단어들을 활용해서, 환자가 진료실에서 의사에게 자연스럽게 말하는 문장을 한 문장으로 만들어줘. "
-        f"예를 들어 '열'은 '열이 나요', '머리 아프다 열 어지럽다'는 '머리가 아프고 열이 나면서 어지러워요'처럼 표현해줘: {words}"
-    )
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": prompt_text}
-                ]
-            }
-        ]
-    }
+    prompt_text = (f"다음에 나열된 단어들만 사용해 자연스러운 문장을 만들어줘. "
+                   f"주어진 단어들의 순서를 재배열하여 문장을 구성해줘: {words}")
+    payload = {"contents": [{"role": "user", "parts": [{"text": prompt_text}]}]}
     headers = {"Content-Type": "application/json"}
-    print("Gemini API 호출 payload:", payload)
+    if DEBUG_MODE:
+        print("Gemini API payload:", payload)
     try:
         response = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=10)
-        print("Gemini API 응답 코드:", response.status_code)
-        print("Gemini API 응답 내용:", response.text)
+        if DEBUG_MODE:
+            print("Gemini API 응답 코드:", response.status_code)
+            print("Gemini API 응답 내용:", response.text)
         if response.status_code == 200:
             data = response.json()
             if "candidates" in data and data["candidates"]:
@@ -210,15 +236,19 @@ def convert_to_sentence(words: str) -> str:
                 parts = candidate.get("content", {}).get("parts", [])
                 if parts:
                     sentence = parts[0].get("text", "").strip()
-                    print("Gemini API로부터 문장 생성 결과:", sentence)
+                    if DEBUG_MODE:
+                        print("Gemini API 결과:", sentence)
                     return sentence
-            print("Gemini API: 예상하는 결과 필드가 없습니다.")
+            if DEBUG_MODE:
+                print("Gemini API: No expected result.")
             return ""
         else:
-            print(f"Gemini API error {response.status_code}: {response.text}")
+            if DEBUG_MODE:
+                print(f"Gemini API error {response.status_code}: {response.text}")
             return ""
     except Exception as e:
-        print(f"Error calling Gemini API: {e}")
+        if DEBUG_MODE:
+            print(f"Gemini API 호출 오류: {e}")
         return ""
 
 def remove_adjacent_duplicates(sentence: str) -> str:
@@ -231,11 +261,10 @@ def remove_adjacent_duplicates(sentence: str) -> str:
             result.append(word)
     return " ".join(result)
 
-# ---------------------------------
+# ------------------------------
 # 글로벌 변수 및 모델/API 설정
-# ---------------------------------
-GEMINI_API_KEY = "AIzaSyAXlJLTGqPLt0euMQSCHkBbvfIfqUP36G0"
-  # 실제 Gemini API 키로 변경
+# ------------------------------
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"  # 실제 API 키로 변경하세요.
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 label_map = {
     0: '가슴', 1: '감사합니다', 2: '구토', 3: '귀', 4: '기침',
@@ -254,46 +283,51 @@ if os.path.exists(model_path):
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 else:
-    print("모델 파일을 찾을 수 없습니다.")
+    if DEBUG_MODE:
+        print("모델 파일이 존재하지 않습니다.")
 
-# TorchScript 모델 생성 (추론 속도 개선)
 example_input = torch.randn(1, 64, 1, 42, 2).to(device)
 scripted_model = torch.jit.trace(model, example_input)
 scripted_model.eval()
-
-# 전역 변수: 예측된 단어 저장
 predicted_words = []
 
-# ---------------------------------
-# VideoCamera 클래스 (영상 캡처와 추론 분리)
-# ---------------------------------
+# ------------------------------
+# VideoCamera 클래스: 영상 캡처, 추론 및 제스처 상태 관리
+# ------------------------------
 class VideoCamera:
     def __init__(self):
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
-            print("웹캠을 열 수 없습니다.")
+            if DEBUG_MODE:
+                print("웹캠 오픈 실패")
         self.latest_frame = None
         self.running = True
         self.lock = threading.Lock()
         self.hands = mp.solutions.hands.Hands(
             static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.4,
-            min_tracking_confidence=0.4
+            max_num_hands=2,  # 두 손 모두 감지
+            model_complexity=1,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.5
         )
-        # 키포인트 저장을 위한 deque (thread-safe 사용)
         self.keypoints_buffer = deque()
         self.SEQUENCE_LENGTH = 64
         self.no_hand_count = 0
-        self.no_hand_threshold = 30  # 약 30 프레임 (약 1초)
+        self.no_hand_threshold = 30  # 약 1초
         self.last_left = None
         self.last_right = None
         self.no_hand_printed = False
-        self.hand_detected = False  # 현재 손 검출 여부
+        self.hand_detected = False
 
-        # 영상 캡처 스레드 시작
+        self.gesture_active = False
+        self.gesture_start_time = None
+        self.stable_gesture = False
+
+        self.display_keypoints = None
+        self.predicted_buffer = []
+        self.consecutive_threshold = 3
+
         threading.Thread(target=self.update, daemon=True).start()
-        # 추론 전용 스레드 시작 (캡처와 분리)
         threading.Thread(target=self.inference_worker, daemon=True).start()
 
     def update(self):
@@ -301,40 +335,61 @@ class VideoCamera:
             ret, frame = self.cap.read()
             if not ret:
                 continue
-
-            # 해상도 축소 (640x480)
             frame = cv2.resize(frame, (640, 480))
             with self.lock:
                 self.latest_frame = frame.copy()
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.hands.process(frame_rgb)
 
-            # 손 검출 여부 업데이트
             if results.multi_hand_landmarks:
                 self.hand_detected = True
+                if self.gesture_start_time is None:
+                    self.gesture_start_time = time.time()
+                elif time.time() - self.gesture_start_time >= 1.0:
+                    self.stable_gesture = True
+                self.gesture_active = True
             else:
                 self.hand_detected = False
 
-            # 키포인트 추출
             keypoints, self.last_left, self.last_right, self.no_hand_printed = process_frame(
                 frame, results, self.last_left, self.last_right, self.no_hand_printed
             )
             with self.lock:
                 self.keypoints_buffer.append(keypoints)
 
-            # 손이 검출되지 않은 경우 카운트
+            if results.multi_hand_landmarks:
+                current_keypoints, _, _, _ = process_frame(
+                    frame, results, self.last_left, self.last_right, self.no_hand_printed
+                )
+                if self.display_keypoints is None:
+                    self.display_keypoints = current_keypoints.copy()
+                else:
+                    alpha_display = 0.8
+                    diff = np.linalg.norm(current_keypoints - self.display_keypoints, axis=1)
+                    threshold = 0.5
+                    new_coords = np.where(diff.reshape(-1, 1) < threshold, current_keypoints, self.display_keypoints)
+                    self.display_keypoints = alpha_display * new_coords + (1 - alpha_display) * self.display_keypoints
+                h, w, _ = frame.shape
+                for idx, (x, y) in enumerate(self.display_keypoints):
+                    cx, cy = int(x * w), int(y * h)
+                    cv2.circle(frame, (cx, cy), 3, (0, 255, 0), -1)
+                    cv2.putText(frame, f"{idx}:({x:.2f},{y:.2f})", (cx, cy),
+                                cv2.FONT_HERSHEY_PLAIN, 0.7, (255, 0, 0), 1, cv2.LINE_AA)
+                with self.lock:
+                    self.latest_frame = frame.copy()
+
             if not results.multi_hand_landmarks:
                 self.no_hand_count += 1
             else:
                 self.no_hand_count = 0
             if self.no_hand_count > self.no_hand_threshold:
-                print("Extended period with no hand detected. Resetting keypoints buffer.")
                 with self.lock:
                     self.keypoints_buffer.clear()
                 self.no_hand_count = 0
 
+            if results.multi_hand_landmarks and self.gesture_start_time is None:
+                self.gesture_start_time = time.time()
             time.sleep(0.005)
-
         self.cap.release()
         cv2.destroyAllWindows()
         self.hands.close()
@@ -343,35 +398,40 @@ class VideoCamera:
         global predicted_words
         while self.running:
             with self.lock:
-                if len(self.keypoints_buffer) >= self.SEQUENCE_LENGTH:
-                    chunk = [self.keypoints_buffer.popleft() for _ in range(self.SEQUENCE_LENGTH)]
-                # 만약 손이 검출되지 않는 상태에서 버퍼에 데이터가 남아있다면 즉시 처리
-                elif not self.hand_detected and len(self.keypoints_buffer) > 0:
+                if not self.hand_detected and len(self.keypoints_buffer) > 0:
                     chunk = list(self.keypoints_buffer)
                     self.keypoints_buffer.clear()
                 else:
                     chunk = None
             if chunk is not None:
+                end_flag = not self.hand_detected
                 prediction, conf = process_keypoints(
                     chunk, self.SEQUENCE_LENGTH, scripted_model, device,
-                    confidence_threshold=0.8, ambiguous_margin=0.2
+                    confidence_threshold=0.8, ambiguous_margin=0.2, end_of_gesture=end_flag
                 )
                 if prediction is not None:
-                    predicted_words.append(prediction)
-                    print(f"Prediction: {prediction} with confidence: {conf:.2f}")
+                    if self.gesture_active and self.stable_gesture:
+                        predicted_words.append(prediction)
+                        if DEBUG_MODE:
+                            print(f"Final Prediction (gesture end): {prediction}")
+                        self.predicted_buffer.clear()
+                        self.gesture_active = False
+                        self.gesture_start_time = None
+                        self.stable_gesture = False
             else:
                 time.sleep(0.005)
-
     def get_frame(self):
         with self.lock:
-            return self.latest_frame.copy() if self.latest_frame is not None else None
-
+            if self.latest_frame is not None:
+                return self.latest_frame.copy()
+            else:
+                return None
     def stop(self):
         self.running = False
 
-# ---------------------------------
-# FastAPI 애플리케이션 및 엔드포인트 정의
-# ---------------------------------
+# ------------------------------
+# FastAPI 엔드포인트 정의
+# ------------------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -380,21 +440,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
-
 video_camera = None
 
 @app.on_event("startup")
 def startup_event():
     global video_camera
     video_camera = VideoCamera()
-    print("VideoCamera 시작됨.")
+    if DEBUG_MODE:
+        print("VideoCamera started.")
 
 @app.on_event("shutdown")
 def shutdown_event():
     global video_camera
     if video_camera is not None:
         video_camera.stop()
-        print("VideoCamera 종료됨.")
+        if DEBUG_MODE:
+            print("VideoCamera stopped.")
 
 @app.get("/video_feed")
 def video_feed():
@@ -406,9 +467,8 @@ def video_feed():
             ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
                 continue
-            frame_bytes = jpeg.tobytes()
             yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
             time.sleep(0.005)
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
@@ -424,13 +484,14 @@ def gen_sentence(word: str = None):
         words_str = word.strip()
     else:
         words_str = " ".join(predicted_words)
-    print("문장 생성을 위한 입력:", words_str)
+    if DEBUG_MODE:
+        print("Input for sentence generation:", words_str)
     if not words_str:
         return {"sentence": "입력된 단어가 없습니다."}
     sentence = convert_to_sentence(words_str)
     processed_sentence = remove_adjacent_duplicates(sentence)
     if not processed_sentence:
-        processed_sentence = "문장 생성에 실패했습니다."
+        processed_sentence = "문장 생성 실패."
     predicted_words.clear()
     return {"sentence": processed_sentence}
 

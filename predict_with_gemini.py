@@ -13,7 +13,7 @@ import os
 from fastapi.middleware.cors import CORSMiddleware
 from collections import deque, Counter
 
-DEBUG_MODE = False  # 필요 시 True로 변경하여 로그를 확인하세요.
+DEBUG_MODE = False  # 필요 시 True로 로그 확인
 
 # ------------------------------
 # 전처리 및 스무딩 함수들
@@ -70,15 +70,14 @@ def smooth_keypoints_ema(kp_seq, alpha=0.7):
     return smoothed
 
 # ------------------------------
-# 프레임 처리: 양손 관절 좌표 추출 및 결합
+# 프레임 처리: 양손 landmark 추출 및 결합
 # ------------------------------
 def process_frame(frame, results, last_left, last_right, no_hand_printed):
     """
-    Mediapipe의 결과에서 두 손의 landmark를 추출하여, 
-    왼손은 인덱스 0~20, 오른손은 인덱스 21~41로 결합합니다.
-    만약 landmark가 21개 미만이면 이전 값(last_left 또는 last_right)을 사용하거나,
-    한쪽 손만 검출되면 그 landmark를 복제하여 양손 모두 채웁니다.
-    좌표는 np.clip()을 통해 [0,1] 범위로 제한됩니다.
+    두 손의 landmark를 추출합니다.
+    - 왼손 landmark는 인덱스 0~20, 오른손은 21~41에 저장.
+    - 만약 landmark 개수가 21개 미만이면 이전 값(last_left/last_right) 혹은 기본값으로 채웁니다.
+    - 한쪽만 검출된 경우, 그 landmark를 복제하여 양손 데이터를 완성합니다.
     """
     combined_keypoints = np.zeros((42, 2), dtype=np.float32)
     left_points = None
@@ -108,8 +107,7 @@ def process_frame(frame, results, last_left, last_right, no_hand_printed):
     else:
         if not no_hand_printed and DEBUG_MODE:
             print("No hand detected; reusing previous landmarks.")
-
-    # 만약 한쪽 손의 landmark가 누락되었으면, 검출된 한쪽의 landmark를 복제하여 사용.
+    
     if left_points is None and right_points is not None:
         left_points = right_points.copy()
     if right_points is None and left_points is not None:
@@ -161,7 +159,8 @@ def process_keypoints(kp_seq_buffer, sequence_length, model_to_use, device,
             if DEBUG_MODE:
                 print("Low confidence, skipping prediction.")
             return None, None
-        diff_prob = (torch.topk(probs, 2).values[0][0] - torch.topk(probs, 2).values[0][1]).item()
+        diff_prob = (torch.topk(probs, 2).values[0][0] - 
+                     torch.topk(probs, 2).values[0][1]).item()
         if DEBUG_MODE:
             print(f"Diff Prob: {diff_prob:.2f}")
         if diff_prob < ambiguous_margin:
@@ -211,7 +210,7 @@ class CNN_LSTMModel(nn.Module):
         return out
 
 # ------------------------------
-# Gemini API 문장 생성 함수 및 Text Post-process
+# Gemini API 문장 생성 함수
 # ------------------------------
 def convert_to_sentence(words: str) -> str:
     if not words.strip():
@@ -370,11 +369,11 @@ class VideoCamera:
                     new_coords = np.where(diff.reshape(-1, 1) < threshold, current_keypoints, self.display_keypoints)
                     self.display_keypoints = alpha_display * new_coords + (1 - alpha_display) * self.display_keypoints
                 h, w, _ = frame.shape
+                # 파란색 텍스트가 아닌, 원만 그리도록 수정함.
                 for idx, (x, y) in enumerate(self.display_keypoints):
                     cx, cy = int(x * w), int(y * h)
                     cv2.circle(frame, (cx, cy), 3, (0, 255, 0), -1)
-                    cv2.putText(frame, f"{idx}:({x:.2f},{y:.2f})", (cx, cy),
-                                cv2.FONT_HERSHEY_PLAIN, 0.7, (255, 0, 0), 1, cv2.LINE_AA)
+                    # cv2.putText 호출 제거: 좌표 텍스트를 출력하지 않음.
                 with self.lock:
                     self.latest_frame = frame.copy()
 
@@ -420,12 +419,14 @@ class VideoCamera:
                         self.stable_gesture = False
             else:
                 time.sleep(0.005)
+
     def get_frame(self):
         with self.lock:
             if self.latest_frame is not None:
                 return self.latest_frame.copy()
             else:
                 return None
+
     def stop(self):
         self.running = False
 
